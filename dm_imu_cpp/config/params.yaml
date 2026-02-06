@@ -1,0 +1,26 @@
+dm_imu:
+  ros__parameters:
+    port: /dev/tty.usbmodemDMIMU202502121
+    baudrate: 921600
+    frame_id: imu_link
+
+    publish_imu_data: true
+    publish_rpy: true
+    publish_pose: true
+
+    publish_rpy_in_degree: true
+    publish_rate_hz: 1000.0
+    qos_reliable: true
+    verbose: true
+
+    debug_raw: false
+    debug_raw_max_bytes: 64
+
+    # Unit conversion for IMU outputs
+    gyro_in_degree: true       # convert deg/s -> rad/s
+    accel_in_g: true           # convert g -> m/s^2
+
+    # Covariance (diagonal values)
+    orientation_covariance: 0.02
+    angular_velocity_covariance: 0.02
+    linear_acceleration_covariance: 0.02

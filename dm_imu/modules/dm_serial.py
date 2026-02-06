@@ -115,6 +115,22 @@ class DM_Serial:
             "last_error": self._last_error,
         }
 
+    def write_bytes(self, data: bytes) -> int:
+        """向串口写入原始字节；返回写入字节数。"""
+        if not self.ser or not self.ser.is_open:
+            self._last_error = "serial not open"
+            return 0
+        try:
+            n = self.ser.write(data)
+            try:
+                self.ser.flush()
+            except Exception:
+                pass
+            return int(n)
+        except Exception as e:
+            self._last_error = str(e)
+            return 0
+
     def last_error(self) -> Optional[str]:
         return self._last_error
 

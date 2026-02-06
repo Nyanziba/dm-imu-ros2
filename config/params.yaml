@@ -11,6 +11,7 @@ dm_imu:
 
     # RPY 的单位（true=度，false=弧度）
     publish_rpy_in_degree: true
+    publish_rate_hz: 1000.0
 
     # 其他
     qos_reliable: true      # 或 true，按你需求
@@ -19,3 +20,19 @@ dm_imu:
     # デバッグ（必要時のみ true）
     debug_raw: true
     debug_raw_max_bytes: 64
+
+    # Unit conversion + covariance
+    gyro_in_degree: true
+    accel_in_g: true
+    orientation_covariance: 0.02
+    angular_velocity_covariance: 0.02
+    linear_acceleration_covariance: 0.02
+
+    # USB quick commands (see DM-IMU-L1 manual)
+    usb_configure: true
+    usb_output_rate_hz: 1000.0
+    usb_enable_accel: true
+    usb_enable_gyro: true
+    usb_enable_rpy: true
+    usb_save_params: true
+    usb_config_sleep_ms: 50
