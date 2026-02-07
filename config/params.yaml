@@ -22,8 +22,9 @@ dm_imu:
     debug_raw_max_bytes: 64
 
     # Unit conversion + covariance
-    gyro_in_degree: true
-    accel_in_g: true
+    # v1.0 observed stream is already SI-like (gyro:rad/s, accel:m/s^2)
+    gyro_in_degree: false
+    accel_in_g: false
     orientation_covariance: 0.02
     angular_velocity_covariance: 0.02
     linear_acceleration_covariance: 0.02

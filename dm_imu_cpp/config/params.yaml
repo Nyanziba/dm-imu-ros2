@@ -17,8 +17,8 @@ dm_imu:
     debug_raw_max_bytes: 64
 
     # Unit conversion for IMU outputs
-    gyro_in_degree: true       # convert deg/s -> rad/s
-    accel_in_g: true           # convert g -> m/s^2
+    gyro_in_degree: false      # v1.0 observed stream is already rad/s
+    accel_in_g: false          # v1.0 observed stream is already m/s^2
 
     # Covariance (diagonal values)
     orientation_covariance: 0.02
