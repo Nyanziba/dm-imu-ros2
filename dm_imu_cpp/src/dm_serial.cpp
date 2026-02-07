@@ -12,6 +12,9 @@
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <IOKit/serial/ioss.h>
+#endif
 
 namespace dm_imu_cpp {
 namespace {
@@ -30,7 +33,9 @@ speed_t baud_to_speed(int baudrate) {
     case 57600: return B57600;
     case 115200: return B115200;
     case 230400: return B230400;
+#ifdef B460800
     case 460800: return B460800;
+#endif
 #ifdef B921600
     case 921600: return B921600;
 #endif
@@ -48,9 +53,6 @@ std::string errno_string(const char* prefix) {
   return msg;
 }
 
-bool valid_rid(uint8_t rid) {
-  return rid == 0x01 || rid == 0x02 || rid == 0x03;
-}
 
 float le_bytes_to_float(const uint8_t* data) {
   float out = 0.0f;
@@ -93,9 +95,44 @@ void DMSerial::stop_reader() {
   }
 }
 
+bool DMSerial::reopen() {
+  stop_reader();
+  close_port();
+  return open_port();
+}
+
+bool DMSerial::write_bytes(const std::vector<uint8_t>& data) {
+  if (fd_ < 0) {
+    std::lock_guard<std::mutex> lock(err_mutex_);
+    last_error_ = "serial not open";
+    return false;
+  }
+  if (data.empty()) {
+    return true;
+  }
+
+  const ssize_t w = ::write(fd_, data.data(), data.size());
+  if (w < 0 || static_cast<size_t>(w) != data.size()) {
+    std::lock_guard<std::mutex> lock(err_mutex_);
+    last_error_ = errno_string("write failed");
+    return false;
+  }
+  if (tcdrain(fd_) != 0) {
+    std::lock_guard<std::mutex> lock(err_mutex_);
+    last_error_ = errno_string("tcdrain failed");
+    return false;
+  }
+  return true;
+}
+
 std::tuple<std::optional<Packet>, double, uint64_t> DMSerial::get_latest() {
   std::lock_guard<std::mutex> lock(latest_mutex_);
   return std::make_tuple(latest_pkt_, latest_ts_, latest_count_);
+}
+
+std::tuple<std::unordered_map<uint8_t, Packet>, double, uint64_t> DMSerial::get_latest_by_type() {
+  std::lock_guard<std::mutex> lock(latest_mutex_);
+  return std::make_tuple(latest_by_type_, latest_ts_, latest_count_);
 }
 
 DebugInfo DMSerial::get_debug() {
@@ -147,11 +184,10 @@ bool DMSerial::open_port() {
   tty.c_cc[VTIME] = 0;
 
   speed_t speed = baud_to_speed(baudrate_);
-  if (speed == 0) {
-    std::lock_guard<std::mutex> lock(err_mutex_);
-    last_error_ = "Unsupported baudrate";
-    close_port();
-    return false;
+  const bool use_custom_speed = (speed == 0);
+  if (use_custom_speed) {
+    // Use a valid baseline termios speed, then set exact baud with platform extension.
+    speed = B115200;
   }
 
   if (cfsetispeed(&tty, speed) != 0 || cfsetospeed(&tty, speed) != 0) {
@@ -168,6 +204,23 @@ bool DMSerial::open_port() {
     return false;
   }
 
+  if (use_custom_speed) {
+#ifdef __APPLE__
+    speed_t requested = static_cast<speed_t>(baudrate_);
+    if (ioctl(fd_, IOSSIOSPEED, &requested) != 0) {
+      std::lock_guard<std::mutex> lock(err_mutex_);
+      last_error_ = errno_string("IOSSIOSPEED failed");
+      close_port();
+      return false;
+    }
+#else
+    std::lock_guard<std::mutex> lock(err_mutex_);
+    last_error_ = "Unsupported baudrate on this platform";
+    close_port();
+    return false;
+#endif
+  }
+
   tcflush(fd_, TCIOFLUSH);
   return true;
 }
@@ -181,16 +234,20 @@ void DMSerial::close_port() {
 
 void DMSerial::reader_loop() {
   while (!stop_) {
-    auto pkt = read_into_buf(std::nullopt);
-    if (pkt > 0) {
+    auto read_size = read_into_buf(std::nullopt);
+    if (read_size > 0) {
       auto frames = parse_all();
       if (!frames.empty()) {
+        const double now = std::chrono::duration<double>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
         std::lock_guard<std::mutex> lock(latest_mutex_);
-        latest_pkt_ = frames.back();
-        latest_ts_ = std::chrono::duration<double>(
-                         std::chrono::system_clock::now().time_since_epoch())
-                         .count();
-        latest_count_ += 1;
+        for (const auto& frame : frames) {
+          latest_pkt_ = frame;
+          latest_by_type_[frame.data_type] = frame;
+        }
+        latest_ts_ = now;
+        latest_count_ += static_cast<uint64_t>(frames.size());
       }
     }
     if (read_sleep_ > 0.0) {
@@ -267,10 +324,8 @@ std::vector<Packet> DMSerial::parse_all() {
       continue;
     }
 
-    uint8_t rid = frame[3];
-    if (!valid_rid(rid)) {
-      continue;
-    }
+    uint8_t dev_id = frame[2];
+    uint8_t data_type = frame[3];
 
     uint16_t crc_calc = 0;
     if (kSkipHdrInCrc) {
@@ -289,7 +344,8 @@ std::vector<Packet> DMSerial::parse_all() {
     }
 
     Packet pkt;
-    pkt.rid = rid;
+    pkt.dev_id = dev_id;
+    pkt.data_type = data_type;
     pkt.v1 = le_bytes_to_float(frame.data() + 4);
     pkt.v2 = le_bytes_to_float(frame.data() + 8);
     pkt.v3 = le_bytes_to_float(frame.data() + 12);

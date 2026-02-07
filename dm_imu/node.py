@@ -53,12 +53,25 @@ class DmImuNode(Node):
 
         # USB quick commands (see PDF)
         self.declare_parameter('usb_configure', True)
+        self.declare_parameter('usb_protocol_version', 'v1_0')  # v1_0 or v1_2
         self.declare_parameter('usb_output_rate_hz', 1000.0)
         self.declare_parameter('usb_enable_accel', True)
         self.declare_parameter('usb_enable_gyro', True)
         self.declare_parameter('usb_enable_rpy', True)
+        self.declare_parameter('usb_enable_quat_cmd', True)
+        self.declare_parameter('usb_force_output_interface', False)  # v1.2 option
+        self.declare_parameter('usb_output_interface', 0)  # 00:USB 01:485 02:CAN 03:VOFA
+        self.declare_parameter('usb_factory_reset_on_start', False)
+        self.declare_parameter('usb_factory_reset_wait_ms', 1200)
         self.declare_parameter('usb_save_params', True)
         self.declare_parameter('usb_config_sleep_ms', 50)
+
+        # Data type IDs (PDF default: accel=1, gyro=2, rpy=3, quat=4)
+        self.declare_parameter('data_type_accel', 0x01)
+        self.declare_parameter('data_type_gyro', 0x02)
+        self.declare_parameter('data_type_rpy', 0x03)
+        self.declare_parameter('data_type_quat', 0x04)
+        self.declare_parameter('warn_unknown_data_type', True)
 
         def _p(name, default=None):
             try:
@@ -99,6 +112,7 @@ class DmImuNode(Node):
             self.linear_acceleration_cov = 0.02
 
         self.usb_configure = bool(_p('usb_configure', True))
+        self.usb_protocol_version = str(_p('usb_protocol_version', 'v1_0')).strip().lower()
         try:
             self.usb_output_rate_hz = float(_p('usb_output_rate_hz', self.publish_rate_hz))
         except Exception:
@@ -106,11 +120,34 @@ class DmImuNode(Node):
         self.usb_enable_accel = bool(_p('usb_enable_accel', True))
         self.usb_enable_gyro = bool(_p('usb_enable_gyro', True))
         self.usb_enable_rpy = bool(_p('usb_enable_rpy', True))
+        self.usb_enable_quat_cmd = bool(_p('usb_enable_quat_cmd', True))
+        self.usb_force_output_interface = bool(_p('usb_force_output_interface', False))
+        try:
+            self.usb_output_interface = int(_p('usb_output_interface', 0))
+        except Exception:
+            self.usb_output_interface = 0
+        self.usb_factory_reset_on_start = bool(_p('usb_factory_reset_on_start', False))
+        try:
+            self.usb_factory_reset_wait_ms = float(_p('usb_factory_reset_wait_ms', 1200))
+        except Exception:
+            self.usb_factory_reset_wait_ms = 1200.0
         self.usb_save_params = bool(_p('usb_save_params', True))
         try:
             self.usb_config_sleep_ms = float(_p('usb_config_sleep_ms', 50))
         except Exception:
             self.usb_config_sleep_ms = 50.0
+
+        try:
+            self.data_type_accel = int(_p('data_type_accel', 0x01))
+            self.data_type_gyro = int(_p('data_type_gyro', 0x02))
+            self.data_type_rpy = int(_p('data_type_rpy', 0x03))
+            self.data_type_quat = int(_p('data_type_quat', 0x04))
+        except Exception:
+            self.data_type_accel = 0x01
+            self.data_type_gyro = 0x02
+            self.data_type_rpy = 0x03
+            self.data_type_quat = 0x04
+        self.warn_unknown_data_type = bool(_p('warn_unknown_data_type', True))
 
         baud = _p('baudrate', 921600)
         try:
@@ -149,6 +186,8 @@ class DmImuNode(Node):
             self.ser = DM_Serial(self.port, baudrate=self.baudrate)
             if self.usb_configure:
                 self._configure_device()
+                if hasattr(self.ser, 'clear_input'):
+                    self.ser.clear_input()
             self.ser.start_reader()  # 后台读线程交给你的类
             self.get_logger().info(f'Opened serial {self.port} @ {self.baudrate}')
         except Exception as e:
@@ -177,6 +216,8 @@ class DmImuNode(Node):
         self._accel_x = 0.0
         self._accel_y = 0.0
         self._accel_z = 0.0
+        self._last_dev_id: Optional[int] = None
+        self._unknown_types_logged = set()
 
         # publish_rate_hz 轮询
         self.timer_pub = self.create_timer(self.publish_period_sec, self._on_timer_publish)
@@ -186,7 +227,13 @@ class DmImuNode(Node):
     # ----------- Timers -----------
     def _on_timer_publish(self):
         try:
-            latest = self.ser.get_latest()
+            if hasattr(self.ser, 'get_latest_by_type'):
+                latest_by_type, stamp_ts, count = self.ser.get_latest_by_type()
+                latest = (latest_by_type, stamp_ts, count)
+                use_latest_by_type = True
+            else:
+                latest = self.ser.get_latest()
+                use_latest_by_type = False
         except Exception as e:
             if self.verbose:
                 self.get_logger().warn(f'get_latest() exception: {e}')
@@ -200,13 +247,16 @@ class DmImuNode(Node):
         pkt = None
         stamp_ts = None
         count = None
-        if isinstance(latest, (tuple, list)) and len(latest) >= 3:
+        latest_map = None
+        if use_latest_by_type:
+            latest_map, stamp_ts, count = latest[0], latest[1], latest[2]
+        elif isinstance(latest, (tuple, list)) and len(latest) >= 3:
             pkt, stamp_ts, count = latest[0], latest[1], latest[2]
         else:
             pkt = latest
 
         # DM_Serial.get_latest() の戻り (pkt, ts, count) で pkt=None の場合は「未受信」
-        if pkt is None:
+        if (use_latest_by_type and (not latest_map)) or (not use_latest_by_type and pkt is None):
             self._no_frame_ticks += 1
             if self._no_frame_ticks % self._no_frame_warn_every == 0 and self.verbose:  # ≈每秒一次
                 self.get_logger().warn('No frames yet from serial (≈1s). Check IMU streaming/baud/crc.')
@@ -226,18 +276,24 @@ class DmImuNode(Node):
             if stamp_ts == self._last_stamp_ts:
                 return
             self._last_stamp_ts = stamp_ts
+        self._no_frame_ticks = 0
 
-        if not self._update_from_packet(pkt):
-            ok, stamp_ts, r_deg, p_deg, y_deg = self._extract_latest(latest)  # 提取数据!!
-            if not ok:
-                if not self._logged_bad_fmt_once and self.verbose:
-                    self.get_logger().warn(f'Unknown latest frame format; example: {repr(latest)}')
-                    self._logged_bad_fmt_once = True
-                return
-            self._r_deg = r_deg
-            self._p_deg = p_deg
-            self._y_deg = y_deg
-            self._has_rpy = True
+        if use_latest_by_type:
+            for pkt in latest_map.values():
+                self._update_from_packet(pkt)
+        else:
+            if not self._update_from_packet(pkt):
+                if not isinstance(pkt, (tuple, list)):
+                    ok, stamp_ts, r_deg, p_deg, y_deg = self._extract_latest(latest)  # 提取数据!!
+                    if not ok:
+                        if not self._logged_bad_fmt_once and self.verbose:
+                            self.get_logger().warn(f'Unknown latest frame format; example: {repr(latest)}')
+                            self._logged_bad_fmt_once = True
+                        return
+                    self._r_deg = r_deg
+                    self._p_deg = p_deg
+                    self._y_deg = y_deg
+                    self._has_rpy = True
 
         if not self._has_rpy:
             return
@@ -373,6 +429,21 @@ class DmImuNode(Node):
                 msg = " ".join([f"{k}={v}" for k, v in stats.items()]) if isinstance(stats, dict) else str(stats)
                 if self.verbose:
                     self.get_logger().info(f'[stats] {msg}')
+            if self.debug_raw and hasattr(self.ser, 'get_latest_by_type'):
+                latest_map, _, _ = self.ser.get_latest_by_type()
+                if latest_map:
+                    type_msg = []
+                    for t in sorted(latest_map.keys()):
+                        pkt = latest_map.get(t)
+                        if not pkt or len(pkt) < 2:
+                            continue
+                        vals = pkt[1]
+                        if isinstance(vals, (tuple, list)) and len(vals) >= 3:
+                            type_msg.append(
+                                f'0x{int(t):02X}=({float(vals[0]):.2f},{float(vals[1]):.2f},{float(vals[2]):.2f})'
+                            )
+                    if type_msg:
+                        self.get_logger().info(f'[types] {" ".join(type_msg)}')
             if self.debug_raw and hasattr(self.ser, 'get_debug'):
                 dbg = self.ser.get_debug()
                 raw_hex = dbg.get("last_read_hex") or ""
@@ -393,22 +464,60 @@ class DmImuNode(Node):
 
     # ----------- Helpers -----------
     def _configure_device(self):
-        """USB 快捷指令配置（见说明书 V1.2）。"""
+        """USB 快捷指令配置（v1.0/v1.2 互換）。"""
         if not hasattr(self.ser, 'write_bytes'):
             if self.verbose:
                 self.get_logger().warn('DM_Serial has no write_bytes(); skip USB configuration.')
             return
 
-        if self.usb_output_rate_hz <= 0:
-            interval_ms = None
-        else:
-            if not (100.0 <= self.usb_output_rate_hz <= 1000.0):
-                self.get_logger().warn(
-                    f'usb_output_rate_hz={self.usb_output_rate_hz} out of 100-1000Hz range; '
-                    'sending anyway.'
-                )
-            interval_ms = int(round(1000.0 / float(self.usb_output_rate_hz)))
-            interval_ms = max(1, min(interval_ms, 0xFFFF))
+        sleep_s = max(0.0, float(self.usb_config_sleep_ms) / 1000.0)
+
+        def _send_cmd(cmd: bytes):
+            n = self.ser.write_bytes(cmd)
+            if self.verbose:
+                self.get_logger().info(f'USB cmd sent ({n}B): {cmd.hex()}')
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+
+        if self.usb_factory_reset_on_start:
+            factory_reset_cmds = [
+                bytes([0xAA, 0x06, 0x01, 0x0D]),  # 进入设置模式
+                bytes([0xAA, 0x0B, 0x01, 0x0D]),  # 恢复出厂设置
+                bytes([0xAA, 0x03, 0x01, 0x0D]),  # 保存参数
+                bytes([0xAA, 0x00, 0x00, 0x0D]),  # 软重启
+            ]
+            for cmd in factory_reset_cmds:
+                _send_cmd(cmd)
+
+            wait_s = max(0.0, float(self.usb_factory_reset_wait_ms) / 1000.0)
+            if wait_s > 0:
+                if self.verbose:
+                    self.get_logger().info(
+                        f'Waiting {wait_s:.3f}s for sensor reboot after factory reset'
+                    )
+                time.sleep(wait_s)
+            if hasattr(self.ser, 'reopen'):
+                try:
+                    if not self.ser.reopen():
+                        self.get_logger().warn(
+                            'Serial reopen after factory reset returned false; continue with current handle.'
+                        )
+                except Exception as e:
+                    self.get_logger().warn(
+                        f'Serial reopen after factory reset failed: {e}; continue with current handle.'
+                    )
+
+        protocol = self.usb_protocol_version
+        is_v1_0 = protocol in ('v1_0', 'v1.0', '1.0', 'v1', 'legacy')
+
+        rate_cmd_v1_0 = {
+            100: 0x01,
+            125: 0x02,
+            200: 0x03,
+            250: 0x04,
+            500: 0x05,
+            1000: 0x06,
+        }
 
         cmds = []
         cmds.append(bytes([0xAA, 0x06, 0x01, 0x0D]))  # 进入设置模式
@@ -418,27 +527,49 @@ class DmImuNode(Node):
             cmds.append(bytes([0xAA, 0x01, 0x15, 0x0D]))  # 开启角速度输出
         if self.usb_enable_rpy:
             cmds.append(bytes([0xAA, 0x01, 0x16, 0x0D]))  # 开启欧拉角输出
-        if interval_ms is not None:
-            lo = interval_ms & 0xFF
-            hi = (interval_ms >> 8) & 0xFF
-            cmds.append(bytes([0xAA, 0x02, lo, hi, 0x0D]))  # 修改反馈频率
+        if self.usb_enable_quat_cmd:
+            cmds.append(bytes([0xAA, 0x01, 0x17, 0x0D]))  # 请求四元数输出（v1.0 可能无输出）
+        if self.usb_force_output_interface and not is_v1_0:
+            iface = max(0, min(int(self.usb_output_interface), 3))
+            cmds.append(bytes([0xAA, 0x0A, iface, 0x0D]))  # 设置输出接口
+
+        if self.usb_output_rate_hz > 0:
+            if is_v1_0:
+                nearest_hz = min(rate_cmd_v1_0.keys(), key=lambda x: abs(float(self.usb_output_rate_hz) - x))
+                rate_code = rate_cmd_v1_0[nearest_hz]
+                cmds.append(bytes([0xAA, 0x02, rate_code, 0x0D]))  # v1.0 频率代码
+                if self.verbose and abs(float(self.usb_output_rate_hz) - nearest_hz) > 1e-6:
+                    self.get_logger().info(
+                        f'usb_output_rate_hz={self.usb_output_rate_hz} mapped to v1.0 rate {nearest_hz}Hz (code=0x{rate_code:02X})'
+                    )
+            else:
+                if not (100.0 <= self.usb_output_rate_hz <= 1000.0):
+                    self.get_logger().warn(
+                        f'usb_output_rate_hz={self.usb_output_rate_hz} out of 100-1000Hz range; '
+                        'sending anyway.'
+                    )
+                interval_ms = int(round(1000.0 / float(self.usb_output_rate_hz)))
+                interval_ms = max(1, min(interval_ms, 0xFFFF))
+                lo = interval_ms & 0xFF
+                hi = (interval_ms >> 8) & 0xFF
+                cmds.append(bytes([0xAA, 0x02, lo, hi, 0x0D]))  # v1.2 反馈频率
         if self.usb_save_params:
             cmds.append(bytes([0xAA, 0x03, 0x01, 0x0D]))  # 保存参数
         cmds.append(bytes([0xAA, 0x06, 0x00, 0x0D]))  # 返回正常模式
 
-        sleep_s = max(0.0, float(self.usb_config_sleep_ms) / 1000.0)
         for cmd in cmds:
-            n = self.ser.write_bytes(cmd)
-            if self.verbose:
-                self.get_logger().info(f'USB cmd sent ({n}B): {cmd.hex()}')
-            if sleep_s > 0:
-                time.sleep(sleep_s)
+            _send_cmd(cmd)
 
     def _update_from_packet(self, pkt) -> bool:
         """更新最新传感器数据，返回是否成功解析。"""
-        if not isinstance(pkt, (tuple, list)) or len(pkt) != 2:
+        if not isinstance(pkt, (tuple, list)) or len(pkt) < 2:
             return False
         rid, vals = pkt[0], pkt[1]
+        if len(pkt) >= 3:
+            try:
+                self._last_dev_id = int(pkt[2])
+            except Exception:
+                self._last_dev_id = None
         if not isinstance(vals, (tuple, list)) or len(vals) < 3:
             return False
         try:
@@ -449,16 +580,26 @@ class DmImuNode(Node):
         except Exception:
             return False
 
-        if rid == 0x01:
+        if rid == self.data_type_accel:
             self._accel_x, self._accel_y, self._accel_z = v1, v2, v3
             self._has_accel = True
-        elif rid == 0x02:
+        elif rid == self.data_type_gyro:
             self._gyro_x, self._gyro_y, self._gyro_z = v1, v2, v3
             self._has_gyro = True
-        elif rid == 0x03:
+        elif rid == self.data_type_rpy:
             self._r_deg, self._p_deg, self._y_deg = v1, v2, v3
             self._has_rpy = True
+        elif rid == self.data_type_quat:
+            # Quaternion output is available but unused in this node.
+            pass
         else:
+            if self.warn_unknown_data_type and rid not in self._unknown_types_logged:
+                self._unknown_types_logged.add(rid)
+                dev = f" dev_id=0x{self._last_dev_id:02X}" if self._last_dev_id is not None else ""
+                self.get_logger().warn(
+                    f'Unknown data_type=0x{rid:02X}{dev}. '
+                    f'Update data_type_* params if needed.'
+                )
             return False
 
         if not self._has_gyro and not self._logged_missing_gyro:
@@ -493,7 +634,7 @@ class DmImuNode(Node):
                 if len(latest) >= 2 and isinstance(latest[0], (tuple, list)):
                     rid_part = latest[0]
                     ts = latest[1] if isinstance(latest[1], (int, float)) else None
-                    if len(rid_part) == 2 and isinstance(rid_part[1], (tuple, list)) and len(rid_part[1]) >= 3:
+                    if len(rid_part) >= 2 and isinstance(rid_part[1], (tuple, list)) and len(rid_part[1]) >= 3:
                         r, p, y = rid_part[1][0], rid_part[1][1], rid_part[1][2]
                         return True, (float(ts) if ts is not None else None), float(r), float(p), float(y)
                 # (rid, r, p, y)
@@ -553,4 +694,8 @@ def main():
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception:
+            pass

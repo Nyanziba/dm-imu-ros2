@@ -8,7 +8,7 @@
 """
 from typing import Iterable
 
-__all__ = ["dm_checksum8", "dm_crc16", "CRC16_TABLE"]
+__all__ = ["dm_checksum8", "dm_crc16", "dm_crc16_ccitt_false", "CRC16_TABLE"]
 
 def dm_checksum8(data: Iterable[int]) -> int:
     """8 位累加和（mod 256）。"""
@@ -46,4 +46,20 @@ def dm_crc16(data: bytes) -> int:
     for b in data:
         index = ((crc >> 8) ^ b) & 0xFF
         crc = ((crc << 1) ^ CRC16_TABLE[index]) & 0xFFFF
+    return crc
+
+
+def dm_crc16_ccitt_false(data: bytes) -> int:
+    """
+    CRC16-CCITT(FALSE), poly=0x1021, init=0xFFFF.
+    v1.0 manual/document and firmware differences are tolerated by checking both styles.
+    """
+    crc = 0xFFFF
+    for b in data:
+        crc ^= (b << 8)
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
     return crc

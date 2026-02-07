@@ -29,10 +29,23 @@ dm_imu:
     linear_acceleration_covariance: 0.02
 
     # USB quick commands (see DM-IMU-L1 manual)
-    usb_configure: true
+    usb_configure: false
+    usb_protocol_version: v1_0
     usb_output_rate_hz: 1000.0
     usb_enable_accel: true
     usb_enable_gyro: true
     usb_enable_rpy: true
+    usb_enable_quat_cmd: true
+    usb_force_output_interface: false
+    usb_output_interface: 0
+    usb_factory_reset_on_start: false
+    usb_factory_reset_wait_ms: 1200
     usb_save_params: true
     usb_config_sleep_ms: 50
+
+    # Data type IDs (factory default in DM-IMU-L1 manual: accel=0x01, gyro=0x02, rpy=0x03, quat=0x04)
+    data_type_accel: 1
+    data_type_gyro: 2
+    data_type_rpy: 3
+    data_type_quat: 4
+    warn_unknown_data_type: true

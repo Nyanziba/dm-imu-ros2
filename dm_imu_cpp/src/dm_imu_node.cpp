@@ -1,8 +1,12 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <iomanip>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/imu.hpp"
@@ -52,11 +56,29 @@ class DmImuNode : public rclcpp::Node {
     declare_parameter<bool>("publish_pose", false);
     declare_parameter<double>("publish_rate_hz", 1000.0);
 
+    // Data type IDs (PDF default: accel=1, gyro=2, rpy=3, quat=4)
+    declare_parameter<int>("data_type_accel", 0x01);
+    declare_parameter<int>("data_type_gyro", 0x02);
+    declare_parameter<int>("data_type_rpy", 0x03);
+    declare_parameter<int>("data_type_quat", 0x04);
+    declare_parameter<bool>("warn_unknown_data_type", true);
+
     declare_parameter<bool>("gyro_in_degree", true);
     declare_parameter<bool>("accel_in_g", true);
     declare_parameter<double>("orientation_covariance", 0.02);
     declare_parameter<double>("angular_velocity_covariance", 0.02);
     declare_parameter<double>("linear_acceleration_covariance", 0.02);
+    declare_parameter<bool>("usb_configure", true);
+    declare_parameter<double>("usb_output_rate_hz", 1000.0);
+    declare_parameter<bool>("usb_enable_accel", true);
+    declare_parameter<bool>("usb_enable_gyro", true);
+    declare_parameter<bool>("usb_enable_rpy", true);
+    declare_parameter<bool>("usb_force_output_interface", true);
+    declare_parameter<int>("usb_output_interface", 0);
+    declare_parameter<bool>("usb_factory_reset_on_start", true);
+    declare_parameter<int>("usb_factory_reset_wait_ms", 1200);
+    declare_parameter<bool>("usb_save_params", true);
+    declare_parameter<double>("usb_config_sleep_ms", 50.0);
 
     port_ = get_parameter("port").as_string();
     baudrate_ = get_parameter("baudrate").as_int();
@@ -66,6 +88,11 @@ class DmImuNode : public rclcpp::Node {
     publish_imu_data_ = get_parameter("publish_imu_data").as_bool();
     publish_pose_ = get_parameter("publish_pose").as_bool();
     publish_rate_hz_ = get_parameter("publish_rate_hz").as_double();
+    data_type_accel_ = get_parameter("data_type_accel").as_int();
+    data_type_gyro_ = get_parameter("data_type_gyro").as_int();
+    data_type_rpy_ = get_parameter("data_type_rpy").as_int();
+    data_type_quat_ = get_parameter("data_type_quat").as_int();
+    warn_unknown_data_type_ = get_parameter("warn_unknown_data_type").as_bool();
     verbose_ = get_parameter("verbose").as_bool();
     debug_raw_ = get_parameter("debug_raw").as_bool();
     debug_raw_max_bytes_ = get_parameter("debug_raw_max_bytes").as_int();
@@ -74,6 +101,17 @@ class DmImuNode : public rclcpp::Node {
     orientation_cov_ = get_parameter("orientation_covariance").as_double();
     angular_velocity_cov_ = get_parameter("angular_velocity_covariance").as_double();
     linear_acceleration_cov_ = get_parameter("linear_acceleration_covariance").as_double();
+    usb_configure_ = get_parameter("usb_configure").as_bool();
+    usb_output_rate_hz_ = get_parameter("usb_output_rate_hz").as_double();
+    usb_enable_accel_ = get_parameter("usb_enable_accel").as_bool();
+    usb_enable_gyro_ = get_parameter("usb_enable_gyro").as_bool();
+    usb_enable_rpy_ = get_parameter("usb_enable_rpy").as_bool();
+    usb_force_output_interface_ = get_parameter("usb_force_output_interface").as_bool();
+    usb_output_interface_ = get_parameter("usb_output_interface").as_int();
+    usb_factory_reset_on_start_ = get_parameter("usb_factory_reset_on_start").as_bool();
+    usb_factory_reset_wait_ms_ = get_parameter("usb_factory_reset_wait_ms").as_int();
+    usb_save_params_ = get_parameter("usb_save_params").as_bool();
+    usb_config_sleep_ms_ = get_parameter("usb_config_sleep_ms").as_double();
 
     const bool qos_reliable = get_parameter("qos_reliable").as_bool();
     rclcpp::QoS qos(50);
@@ -96,6 +134,9 @@ class DmImuNode : public rclcpp::Node {
 
     try {
       serial_ = std::make_unique<DMSerial>(port_, baudrate_);
+      if (usb_configure_) {
+        configure_device();
+      }
       serial_->start_reader();
       RCLCPP_INFO(get_logger(), "Opened serial %s @ %d", port_.c_str(), baudrate_);
     } catch (const std::exception& e) {
@@ -121,13 +162,117 @@ class DmImuNode : public rclcpp::Node {
   }
 
  private:
+  void configure_device() {
+    if (!serial_) {
+      return;
+    }
+
+    auto to_hex = [](const std::vector<uint8_t>& cmd) -> std::string {
+      std::ostringstream oss;
+      oss << std::hex << std::setfill('0');
+      for (uint8_t b : cmd) {
+        oss << std::setw(2) << static_cast<int>(b);
+      }
+      return oss.str();
+    };
+
+    const double sleep_s = std::max(0.0, usb_config_sleep_ms_ / 1000.0);
+    auto send_cmd = [&](const std::vector<uint8_t>& cmd) {
+      const bool ok = serial_->write_bytes(cmd);
+      if (verbose_) {
+        RCLCPP_INFO(get_logger(), "USB cmd sent (%zuB): %s", cmd.size(), to_hex(cmd).c_str());
+      }
+      if (!ok) {
+        RCLCPP_WARN(get_logger(), "USB cmd write failed: %s", serial_->last_error().c_str());
+      }
+      if (sleep_s > 0.0) {
+        std::this_thread::sleep_for(std::chrono::duration<double>(sleep_s));
+      }
+    };
+
+    if (usb_factory_reset_on_start_) {
+      send_cmd({0xAA, 0x06, 0x01, 0x0D});  // enter setting mode
+      send_cmd({0xAA, 0x0B, 0x01, 0x0D});  // factory reset
+      send_cmd({0xAA, 0x03, 0x01, 0x0D});  // save
+      send_cmd({0xAA, 0x00, 0x00, 0x0D});  // soft reboot
+
+      const auto wait_ms = std::max(0, usb_factory_reset_wait_ms_);
+      if (wait_ms > 0) {
+        if (verbose_) {
+          RCLCPP_INFO(get_logger(),
+                      "Waiting %dms for sensor reboot after factory reset",
+                      wait_ms);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
+      }
+      if (!serial_->reopen()) {
+        RCLCPP_WARN(get_logger(),
+                    "Serial reopen after factory reset failed: %s",
+                    serial_->last_error().c_str());
+      }
+    }
+
+    int interval_ms = -1;
+    if (usb_output_rate_hz_ > 0.0) {
+      if (usb_output_rate_hz_ < 100.0 || usb_output_rate_hz_ > 1000.0) {
+        RCLCPP_WARN(get_logger(),
+                    "usb_output_rate_hz=%.3f out of 100-1000Hz range; sending anyway.",
+                    usb_output_rate_hz_);
+      }
+      interval_ms = static_cast<int>(std::lround(1000.0 / usb_output_rate_hz_));
+      if (interval_ms < 1) {
+        interval_ms = 1;
+      } else if (interval_ms > 0xFFFF) {
+        interval_ms = 0xFFFF;
+      }
+    }
+
+    std::vector<std::vector<uint8_t>> cmds;
+    cmds.push_back({0xAA, 0x06, 0x01, 0x0D});  // enter setting mode
+    if (usb_enable_accel_) {
+      cmds.push_back({0xAA, 0x01, 0x14, 0x0D});
+    }
+    if (usb_enable_gyro_) {
+      cmds.push_back({0xAA, 0x01, 0x15, 0x0D});
+    }
+    if (usb_enable_rpy_) {
+      cmds.push_back({0xAA, 0x01, 0x16, 0x0D});
+    }
+    if (usb_force_output_interface_) {
+      int iface = usb_output_interface_;
+      if (iface < 0) {
+        iface = 0;
+      } else if (iface > 3) {
+        iface = 3;
+      }
+      cmds.push_back({0xAA, 0x0A, static_cast<uint8_t>(iface), 0x0D});
+    }
+    if (interval_ms > 0) {
+      cmds.push_back({
+          0xAA,
+          0x02,
+          static_cast<uint8_t>(interval_ms & 0xFF),
+          static_cast<uint8_t>((interval_ms >> 8) & 0xFF),
+          0x0D,
+      });
+    }
+    if (usb_save_params_) {
+      cmds.push_back({0xAA, 0x03, 0x01, 0x0D});
+    }
+    cmds.push_back({0xAA, 0x06, 0x00, 0x0D});  // exit setting mode
+
+    for (const auto& cmd : cmds) {
+      send_cmd(cmd);
+    }
+  }
+
   void on_timer_publish() {
     if (!serial_) {
       return;
     }
-    auto [pkt_opt, stamp_ts, count] = serial_->get_latest();
+    auto [packets_by_type, stamp_ts, count] = serial_->get_latest_by_type();
     (void)stamp_ts;
-    if (!pkt_opt) {
+    if (packets_by_type.empty()) {
       no_frame_ticks_ += 1;
       if (warn_every_ticks_ > 0 && no_frame_ticks_ % warn_every_ticks_ == 0 && verbose_) {
         RCLCPP_WARN(get_logger(), "No frames yet from serial (≈1s). Check IMU streaming/baud/crc.");
@@ -140,9 +285,12 @@ class DmImuNode : public rclcpp::Node {
     }
     last_count_ = count;
 
-    update_from_packet(*pkt_opt);
+    for (const auto& kv : packets_by_type) {
+      update_from_packet(kv.second);
+    }
 
     if (!has_rpy_) {
+      no_frame_ticks_ = 0;
       return;
     }
 
@@ -309,27 +457,38 @@ class DmImuNode : public rclcpp::Node {
   }
 
   void update_from_packet(const Packet& pkt) {
-    switch (pkt.rid) {
-      case 0x01:
-        r_deg_ = pkt.v1;
-        p_deg_ = pkt.v2;
-        y_deg_ = pkt.v3;
-        has_rpy_ = true;
-        break;
-      case 0x02:
-        gyro_x_ = pkt.v1;
-        gyro_y_ = pkt.v2;
-        gyro_z_ = pkt.v3;
-        has_gyro_ = true;
-        break;
-      case 0x03:
-        accel_x_ = pkt.v1;
-        accel_y_ = pkt.v2;
-        accel_z_ = pkt.v3;
-        has_accel_ = true;
-        break;
-      default:
-        break;
+    const uint8_t dtype = pkt.data_type;
+
+    if (dtype == static_cast<uint8_t>(data_type_rpy_)) {
+      r_deg_ = pkt.v1;
+      p_deg_ = pkt.v2;
+      y_deg_ = pkt.v3;
+      has_rpy_ = true;
+    } else if (dtype == static_cast<uint8_t>(data_type_gyro_)) {
+      gyro_x_ = pkt.v1;
+      gyro_y_ = pkt.v2;
+      gyro_z_ = pkt.v3;
+      has_gyro_ = true;
+    } else if (dtype == static_cast<uint8_t>(data_type_accel_)) {
+      accel_x_ = pkt.v1;
+      accel_y_ = pkt.v2;
+      accel_z_ = pkt.v3;
+      has_accel_ = true;
+    } else if (dtype == static_cast<uint8_t>(data_type_quat_)) {
+      // Quaternion output is available but unused in this node.
+    } else if (warn_unknown_data_type_ && !unknown_data_type_logged_[dtype]) {
+      unknown_data_type_logged_[dtype] = true;
+      if (verbose_) {
+        if (pkt.dev_id) {
+          RCLCPP_WARN(get_logger(),
+                      "Unknown data_type=0x%02X dev_id=0x%02X. Update data_type_* params if needed.",
+                      dtype, pkt.dev_id);
+        } else {
+          RCLCPP_WARN(get_logger(),
+                      "Unknown data_type=0x%02X. Update data_type_* params if needed.",
+                      dtype);
+        }
+      }
     }
 
     if (!has_gyro_ && !logged_missing_gyro_) {
@@ -363,6 +522,11 @@ class DmImuNode : public rclcpp::Node {
   bool publish_imu_data_ = true;
   bool publish_pose_ = false;
   double publish_rate_hz_ = 1000.0;
+  int data_type_accel_ = 0x01;
+  int data_type_gyro_ = 0x02;
+  int data_type_rpy_ = 0x03;
+  int data_type_quat_ = 0x04;
+  bool warn_unknown_data_type_ = true;
   bool verbose_ = true;
   bool debug_raw_ = false;
   int debug_raw_max_bytes_ = 64;
@@ -371,6 +535,17 @@ class DmImuNode : public rclcpp::Node {
   double orientation_cov_ = 0.02;
   double angular_velocity_cov_ = 0.02;
   double linear_acceleration_cov_ = 0.02;
+  bool usb_configure_ = true;
+  double usb_output_rate_hz_ = 1000.0;
+  bool usb_enable_accel_ = true;
+  bool usb_enable_gyro_ = true;
+  bool usb_enable_rpy_ = true;
+  bool usb_force_output_interface_ = true;
+  int usb_output_interface_ = 0;
+  bool usb_factory_reset_on_start_ = true;
+  int usb_factory_reset_wait_ms_ = 1200;
+  bool usb_save_params_ = true;
+  double usb_config_sleep_ms_ = 50.0;
 
   uint64_t last_count_ = 0;
   uint64_t no_frame_ticks_ = 0;
@@ -382,6 +557,7 @@ class DmImuNode : public rclcpp::Node {
   bool has_accel_ = false;
   bool logged_missing_gyro_ = false;
   bool logged_missing_accel_ = false;
+  std::array<bool, 256> unknown_data_type_logged_{};
 
   double r_deg_ = 0.0;
   double p_deg_ = 0.0;

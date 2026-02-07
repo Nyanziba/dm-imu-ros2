@@ -6,12 +6,14 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace dm_imu_cpp {
 
 struct Packet {
-  uint8_t rid = 0;
+  uint8_t data_type = 0;
+  uint8_t dev_id = 0;
   float v1 = 0.0f;
   float v2 = 0.0f;
   float v3 = 0.0f;
@@ -37,8 +39,11 @@ class DMSerial {
 
   bool start_reader(double read_sleep = 0.001);
   void stop_reader();
+  bool reopen();
+  bool write_bytes(const std::vector<uint8_t>& data);
 
   std::tuple<std::optional<Packet>, double, uint64_t> get_latest();
+  std::tuple<std::unordered_map<uint8_t, Packet>, double, uint64_t> get_latest_by_type();
   DebugInfo get_debug();
   std::string last_error() const;
 
@@ -71,6 +76,7 @@ class DMSerial {
 
   mutable std::mutex latest_mutex_;
   std::optional<Packet> latest_pkt_;
+  std::unordered_map<uint8_t, Packet> latest_by_type_;
   double latest_ts_ = 0.0;
   uint64_t latest_count_ = 0;
 
