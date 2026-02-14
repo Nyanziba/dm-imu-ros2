@@ -79,6 +79,8 @@ class DmImuNode : public rclcpp::Node {
     declare_parameter<int>("usb_factory_reset_wait_ms", 1200);
     declare_parameter<bool>("usb_save_params", true);
     declare_parameter<double>("usb_config_sleep_ms", 50.0);
+    declare_parameter<std::string>("usb_protocol_version", "v1_0");
+    declare_parameter<bool>("usb_enable_quat_cmd", true);
 
     port_ = get_parameter("port").as_string();
     baudrate_ = get_parameter("baudrate").as_int();
@@ -112,6 +114,8 @@ class DmImuNode : public rclcpp::Node {
     usb_factory_reset_wait_ms_ = get_parameter("usb_factory_reset_wait_ms").as_int();
     usb_save_params_ = get_parameter("usb_save_params").as_bool();
     usb_config_sleep_ms_ = get_parameter("usb_config_sleep_ms").as_double();
+    usb_protocol_version_ = get_parameter("usb_protocol_version").as_string();
+    usb_enable_quat_cmd_ = get_parameter("usb_enable_quat_cmd").as_bool();
 
     const bool qos_reliable = get_parameter("qos_reliable").as_bool();
     rclcpp::QoS qos(50);
@@ -212,20 +216,12 @@ class DmImuNode : public rclcpp::Node {
       }
     }
 
-    int interval_ms = -1;
-    if (usb_output_rate_hz_ > 0.0) {
-      if (usb_output_rate_hz_ < 100.0 || usb_output_rate_hz_ > 1000.0) {
-        RCLCPP_WARN(get_logger(),
-                    "usb_output_rate_hz=%.3f out of 100-1000Hz range; sending anyway.",
-                    usb_output_rate_hz_);
-      }
-      interval_ms = static_cast<int>(std::lround(1000.0 / usb_output_rate_hz_));
-      if (interval_ms < 1) {
-        interval_ms = 1;
-      } else if (interval_ms > 0xFFFF) {
-        interval_ms = 0xFFFF;
-      }
-    }
+    // Determine protocol version
+    // Simple check: keywords 'v1.0', '1.0', 'legacy' -> v1.0
+    // Otherwise assume v1.2 (which uses interval ms)
+    std::string proto = usb_protocol_version_;
+    std::transform(proto.begin(), proto.end(), proto.begin(), ::tolower);
+    bool is_v1_0 = (proto == "v1_0" || proto == "v1.0" || proto == "1.0" || proto == "legacy" || proto == "v1");
 
     std::vector<std::vector<uint8_t>> cmds;
     cmds.push_back({0xAA, 0x06, 0x01, 0x0D});  // enter setting mode
@@ -238,24 +234,64 @@ class DmImuNode : public rclcpp::Node {
     if (usb_enable_rpy_) {
       cmds.push_back({0xAA, 0x01, 0x16, 0x0D});
     }
-    if (usb_force_output_interface_) {
+    if (usb_enable_quat_cmd_) {
+      cmds.push_back({0xAA, 0x01, 0x17, 0x0D});
+    }
+
+    if (usb_force_output_interface_ && !is_v1_0) {
       int iface = usb_output_interface_;
-      if (iface < 0) {
-        iface = 0;
-      } else if (iface > 3) {
-        iface = 3;
-      }
+      if (iface < 0) iface = 0;
+      if (iface > 3) iface = 3;
       cmds.push_back({0xAA, 0x0A, static_cast<uint8_t>(iface), 0x0D});
     }
-    if (interval_ms > 0) {
-      cmds.push_back({
-          0xAA,
-          0x02,
-          static_cast<uint8_t>(interval_ms & 0xFF),
-          static_cast<uint8_t>((interval_ms >> 8) & 0xFF),
-          0x0D,
-      });
+
+    if (usb_output_rate_hz_ > 0.0) {
+      if (is_v1_0) {
+        // v1.0 uses specific codes for specific rates
+        // 100->0x01, 125->0x02, 200->0x03, 250->0x04, 500->0x05, 1000->0x06
+        // Map to nearest
+        struct RateMap { double hz; uint8_t code; };
+        std::vector<RateMap> maps = {
+            {100.0, 0x01}, {125.0, 0x02}, {200.0, 0x03},
+            {250.0, 0x04}, {500.0, 0x05}, {1000.0, 0x06}
+        };
+        uint8_t best_code = 0x06;
+        double min_diff = 1e9;
+        double matched_hz = 1000.0;
+        for (const auto& m : maps) {
+            double diff = std::abs(m.hz - usb_output_rate_hz_);
+            if (diff < min_diff) {
+                min_diff = diff;
+                best_code = m.code;
+                matched_hz = m.hz;
+            }
+        }
+        cmds.push_back({0xAA, 0x02, best_code, 0x0D});
+        if (verbose_ && std::abs(usb_output_rate_hz_ - matched_hz) > 1e-1) {
+             RCLCPP_INFO(get_logger(), "usb_output_rate_hz=%.1f mapped to v1.0 code 0x%02X (%.1fHz)",
+                         usb_output_rate_hz_, best_code, matched_hz);
+        }
+      } else {
+        // v1.2 uses interval in ms (2 bytes)
+        if (usb_output_rate_hz_ < 100.0 || usb_output_rate_hz_ > 1000.0) {
+          RCLCPP_WARN(get_logger(),
+                      "usb_output_rate_hz=%.3f out of 100-1000Hz range; sending anyway.",
+                      usb_output_rate_hz_);
+        }
+        int interval_ms = static_cast<int>(std::lround(1000.0 / usb_output_rate_hz_));
+        if (interval_ms < 1) interval_ms = 1;
+        if (interval_ms > 0xFFFF) interval_ms = 0xFFFF;
+
+        cmds.push_back({
+            0xAA,
+            0x02,
+            static_cast<uint8_t>(interval_ms & 0xFF),
+            static_cast<uint8_t>((interval_ms >> 8) & 0xFF),
+            0x0D,
+        });
+      }
     }
+
     if (usb_save_params_) {
       cmds.push_back({0xAA, 0x03, 0x01, 0x0D});
     }
@@ -265,6 +301,7 @@ class DmImuNode : public rclcpp::Node {
       send_cmd(cmd);
     }
   }
+
 
   void on_timer_publish() {
     if (!serial_) {
@@ -546,6 +583,8 @@ class DmImuNode : public rclcpp::Node {
   int usb_factory_reset_wait_ms_ = 1200;
   bool usb_save_params_ = true;
   double usb_config_sleep_ms_ = 50.0;
+  std::string usb_protocol_version_ = "v1_0";
+  bool usb_enable_quat_cmd_ = true;
 
   uint64_t last_count_ = 0;
   uint64_t no_frame_ticks_ = 0;
